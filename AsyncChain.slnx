@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="AsyncChain/AsyncChain.Vsix/AsyncChain.Vsix.csproj" />
+  <Project Path="AsyncChain/AsyncChain/AsyncChain.csproj" />
+</Solution>
