@@ -6,7 +6,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Editing;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
-using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Composition;
@@ -26,74 +26,48 @@ namespace AsyncChain
 
             if (!(node is MethodDeclarationSyntax methodDeclaration)) return;
 
-            SemanticModel semanticModel = await context.Document.GetSemanticModelAsync(context.CancellationToken).ConfigureAwait(false);
-            bool isAwaitable = IsAwaitable(methodDeclaration, semanticModel);
-
-            CodeAction action = CodeAction.Create("Build async caller chain", cancellationToken => BuildAsyncChain(context.Document, methodDeclaration, cancellationToken));
+            CodeAction action = CodeAction.Create("Build async chain", cancellationToken => BuildAsyncChain(context.Document, methodDeclaration, cancellationToken));
 
             context.RegisterRefactoring(action);
         }
 
         private static async Task<Solution> BuildAsyncChain(Document document, MethodDeclarationSyntax methodDeclaration, CancellationToken cancellationToken = default)
         {
-            Solution currentSolution = document.Project.Solution;
-            SemanticModel semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
-
-            IEnumerable<UpdateInfo> updateInfos = await GetUpdateInfo(document, methodDeclaration, cancellationToken);
+            List<UpdateInfo> updateInfos = await GetUpdateInfo(document, methodDeclaration, cancellationToken);
+            SolutionEditor solutionEditor = new SolutionEditor(document.Project.Solution);
 
             foreach (IGrouping<DocumentId, UpdateInfo> documentGroup in updateInfos.GroupBy(i => i.DocumentId))
             {
-                Document currentDocument = currentSolution.GetDocument(documentGroup.Key);
-                if (currentDocument == null) continue;
+                DocumentEditor documentEditor = await solutionEditor.GetDocumentEditorAsync(documentGroup.Key, cancellationToken).ConfigureAwait(false);
 
-                SyntaxNode root = await currentDocument.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+                ImmutableHashSet<CallUpdateInfo> callUpdateInfos = documentGroup.OfType<CallUpdateInfo>().ToImmutableHashSet();
+                List<MethodUpdateInfo> methodUpdateInfos = documentGroup.OfType<MethodUpdateInfo>().ToList();
 
-                List<SyntaxNode> nodesToTrack = documentGroup.Select(i => root.FindNode(i.Span)).ToList();
-                SyntaxNode trackedRoot = root.TrackNodes(nodesToTrack);
-
-                Document trackedDocument = currentDocument.WithSyntaxRoot(trackedRoot);
-                DocumentEditor editor = await DocumentEditor.CreateAsync(trackedDocument, cancellationToken).ConfigureAwait(false);
-
-                SyntaxNode currentTrackedRoot = await trackedDocument.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
-
-                List<UpdateInfo> updates = documentGroup.ToList();
-
-                foreach (CallUpdateInfo callUpdateInfo in updates.OfType<CallUpdateInfo>().OrderByDescending(i => i.Span.Start))
+                foreach (MethodUpdateInfo methodUpdateInfo in methodUpdateInfos)
                 {
-                    SyntaxNode originalNode = root.FindNode(callUpdateInfo.Span);
-                    SyntaxNode currentNode = currentTrackedRoot.GetCurrentNode(originalNode);
+                    List<CallUpdateInfo> invocations = callUpdateInfos.Where(i => SymbolEqualityComparer.Default.Equals(i.CallingMethod, methodUpdateInfo.Method)).ToList();
+                    SyntaxNode originalMethodNode = documentEditor.OriginalRoot.FindNode(methodUpdateInfo.Span);
+                    List<SyntaxNode> invocationNodes = invocations.Select(i => documentEditor.OriginalRoot.FindNode(i.Span)).ToList();
+                    MethodDeclarationSyntax replaceMethodNode = UpdateMethodDeclaration(documentEditor.SemanticModel, originalMethodNode, methodUpdateInfo, invocations);
 
-                    if (currentNode != null)
-                    {
-                        UpdateCallSite(editor, currentNode, callUpdateInfo);
-                    }
+                    documentEditor.ReplaceNode(originalMethodNode, replaceMethodNode);
+
+                    foreach (CallUpdateInfo invocation in invocations) callUpdateInfos.Remove(invocation);
                 }
 
-                foreach (MethodUpdateInfo methodUpdateInfo in updates.OfType<MethodUpdateInfo>().OrderByDescending(i => i.Span.Start))
-                {
-                    SyntaxNode originalNode = root.FindNode(methodUpdateInfo.Span);
-                    SyntaxNode currentNode = currentTrackedRoot.GetCurrentNode(originalNode);
-
-                    if (currentNode != null)
-                    {
-                        UpdateMethodSignature(editor, currentNode, methodUpdateInfo);
-                    }
-                }
-
-                Document updatedDocument = editor.GetChangedDocument();
-                currentSolution = updatedDocument.Project.Solution;
+                AddRequiredNamespaces(documentEditor);
             }
 
-            return currentSolution;
+            return solutionEditor.GetChangedSolution();
         }
 
-        private static async Task<IEnumerable<UpdateInfo>> GetUpdateInfo(Document document, MethodDeclarationSyntax methodDeclaration, CancellationToken cancellationToken = default)
+        private static async Task<List<UpdateInfo>> GetUpdateInfo(Document document, MethodDeclarationSyntax methodDeclaration, CancellationToken cancellationToken = default)
         {
             Solution solution = document.Project.Solution;
             SemanticModel semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
 
             IMethodSymbol startMethodSymbol = semanticModel.GetDeclaredSymbol(methodDeclaration, cancellationToken);
-            if (startMethodSymbol is null) return Array.Empty<UpdateInfo>();
+            if (startMethodSymbol is null) return new List<UpdateInfo>();
 
             var updateInfo = new List<UpdateInfo>();
 
@@ -115,6 +89,14 @@ namespace AsyncChain
                     Method = currentSymbol
                 }));
 
+                IEnumerable<ISymbol> overrides = await SymbolFinder.FindOverridesAsync(currentSymbol, solution, null, cancellationToken).ConfigureAwait(false);
+
+                foreach (ISymbol overrideSymbol in overrides)
+                {
+                    if (overrideSymbol is IMethodSymbol overrideMethod && !processedSymbols.Contains(overrideMethod))
+                        methodsToProcess.Enqueue(overrideMethod);
+                }
+
                 IEnumerable<SymbolCallerInfo> callers = await SymbolFinder.FindCallersAsync(currentSymbol, solution, cancellationToken).ConfigureAwait(false);
 
                 foreach (SymbolCallerInfo caller in callers)
@@ -123,84 +105,98 @@ namespace AsyncChain
 
                     updateInfo.AddRange(caller.Locations.Where(l => l.IsInSource).Select(l => new CallUpdateInfo
                     {
-                        DocumentId = solution.GetDocument(l.SourceTree)?.Id,
-                        Span = l.SourceSpan
+                        DocumentId = solution.GetDocument(l.SourceTree).Id,
+                        Span = l.SourceSpan,
+                        CallingMethod = callerMethodSymbol,
+                        CalledMethod = currentSymbol
                     }));
 
-                    if (!processedSymbols.Contains(callerMethodSymbol)) methodsToProcess.Enqueue(callerMethodSymbol);
+                    if (!processedSymbols.Contains(callerMethodSymbol) && !IsAwaitable(callerMethodSymbol)) methodsToProcess.Enqueue(callerMethodSymbol);
                 }
             }
 
             return updateInfo;
         }
 
-        private static void UpdateCallSite(DocumentEditor editor, SyntaxNode currentNode, CallUpdateInfo update)
+        private static SyntaxNode UpdateInvocationExpression(SyntaxNode currentNode)
         {
-            InvocationExpressionSyntax invocation = currentNode as InvocationExpressionSyntax ?? currentNode.FirstAncestorOrSelf<InvocationExpressionSyntax>();
-            if (invocation is null) return;
+            InvocationExpressionSyntax newNode = currentNode as InvocationExpressionSyntax ?? currentNode.FirstAncestorOrSelf<InvocationExpressionSyntax>();
+            if (newNode is null) return newNode;
 
-            InvocationExpressionSyntax updatedInvocation = invocation;
-
-            if (!invocation.ArgumentList.Arguments.Any(a => a.Expression is IdentifierNameSyntax id && id.Identifier.Text == "cancellationToken"))
+            if (!newNode.ArgumentList.Arguments.Any(a => a.Expression is IdentifierNameSyntax id && id.Identifier.Text == "cancellationToken"))
             {
                 ArgumentSyntax tokenArg = SyntaxFactory.Argument(SyntaxFactory.IdentifierName("cancellationToken"));
-                updatedInvocation = invocation.AddArgumentListArguments(tokenArg);
+                newNode = newNode.AddArgumentListArguments(tokenArg);
             }
 
-            SyntaxNode finalNode;
+            if (newNode.Parent is AwaitExpressionSyntax) return newNode;
 
-            if (invocation.Parent is AwaitExpressionSyntax)
-            {
-                finalNode = updatedInvocation;
-            }
-            else
-            {
-                finalNode = SyntaxFactory.AwaitExpression(
-                    SyntaxFactory.Token(SyntaxKind.AwaitKeyword).WithTrailingTrivia(SyntaxFactory.Space),updatedInvocation.WithoutTrivia())
-                        .WithLeadingTrivia(invocation.GetLeadingTrivia())
-                        .WithTrailingTrivia(invocation.GetTrailingTrivia());
-            }
-
-            editor.ReplaceNode(invocation, finalNode);
+            return SyntaxFactory.AwaitExpression(
+                SyntaxFactory.Token(SyntaxKind.AwaitKeyword).WithTrailingTrivia(SyntaxFactory.Space), newNode.WithoutTrivia())
+                    .WithLeadingTrivia(currentNode.GetLeadingTrivia())
+                    .WithTrailingTrivia(currentNode.GetTrailingTrivia());
         }
 
-        private static void UpdateMethodSignature(DocumentEditor editor, SyntaxNode currentNode, MethodUpdateInfo update)
+        private static MethodDeclarationSyntax UpdateMethodDeclaration(SemanticModel semanticModel, SyntaxNode currentNode, MethodUpdateInfo methodUpdateInfo, List<CallUpdateInfo> callUpdateInfos)
         {
-            MethodDeclarationSyntax methodNode = currentNode as MethodDeclarationSyntax ?? currentNode.FirstAncestorOrSelf<MethodDeclarationSyntax>();
-            if (methodNode is null) return;
+            MethodDeclarationSyntax newNode = currentNode as MethodDeclarationSyntax ?? currentNode.FirstAncestorOrSelf<MethodDeclarationSyntax>();
+            if (newNode is null) return null;
 
-            editor.ReplaceNode(methodNode, (original, generator) =>
+            var invocationNodes = new List<InvocationExpressionSyntax>();
+            List<IMethodSymbol> targetSymbols = callUpdateInfos.Select(cui => cui.CalledMethod).ToList();
+
+            foreach (var invocation in newNode.DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
-                MethodDeclarationSyntax method = (MethodDeclarationSyntax)original;
+                if (!(semanticModel.GetSymbolInfo(invocation).Symbol is IMethodSymbol methodSymbol)) continue;
+                if (targetSymbols.Any(ts => SymbolEqualityComparer.Default.Equals(ts, methodSymbol))) invocationNodes.Add(invocation);
+            }
 
-                if (!method.Modifiers.Any(SyntaxKind.AsyncKeyword))
-                {
-                    method = method.AddModifiers(SyntaxFactory.Token(SyntaxKind.AsyncKeyword));
-                }
+            newNode = newNode.ReplaceNodes(invocationNodes, (original, rewritten) => UpdateInvocationExpression(original));
 
-                if (!IsAwaitable(update.Method))
-                {
-                    TypeSyntax returnType = method.ReturnType;
-                    TypeSyntax newReturnType = (returnType is PredefinedTypeSyntax predefined && predefined.Keyword.IsKind(SyntaxKind.VoidKeyword))
-                        ? SyntaxFactory.ParseTypeName("Task")
-                        : SyntaxFactory.ParseTypeName($"Task<{returnType.WithoutTrivia()}>");
+            if (!IsAwaitable(methodUpdateInfo.Method))
+            {
+                TypeSyntax returnType = newNode.ReturnType;
+                TypeSyntax newReturnType = (returnType is PredefinedTypeSyntax predefined && predefined.Keyword.IsKind(SyntaxKind.VoidKeyword))
+                    ? SyntaxFactory.ParseTypeName("Task")
+                    : SyntaxFactory.ParseTypeName($"Task<{returnType.WithoutTrivia()}>");
 
-                    method = method.WithReturnType(newReturnType.WithTrailingTrivia(returnType.GetTrailingTrivia()));
-                }
+                newNode = newNode.WithReturnType(newReturnType.WithTrailingTrivia(returnType.GetTrailingTrivia()));
+            }
 
-                if (!update.Method.Parameters.Any(p => p.Type.ToDisplayString().Contains("CancellationToken")))
-                {
-                    ParameterSyntax tokenParameter = SyntaxFactory.Parameter(SyntaxFactory.Identifier("cancellationToken"))
-                        .WithType(SyntaxFactory.ParseTypeName("CancellationToken"))
-                        .WithDefault(SyntaxFactory.EqualsValueClause(
-                            SyntaxFactory.LiteralExpression(SyntaxKind.DefaultLiteralExpression, SyntaxFactory.Token(SyntaxKind.DefaultKeyword))
-                        ));
+            if (!methodUpdateInfo.Method.Parameters.Any(p => p.Type.ToDisplayString().Contains("CancellationToken")))
+            {
+                ParameterSyntax tokenParameter = SyntaxFactory.Parameter(SyntaxFactory.Identifier("cancellationToken"))
+                    .WithType(SyntaxFactory.ParseTypeName("CancellationToken"))
+                    .WithDefault(SyntaxFactory.EqualsValueClause(
+                        SyntaxFactory.LiteralExpression(SyntaxKind.DefaultLiteralExpression, SyntaxFactory.Token(SyntaxKind.DefaultKeyword))
+                    ));
 
-                    method = method.AddParameterListParameters(tokenParameter);
-                }
+                newNode = newNode.AddParameterListParameters(tokenParameter);
+            }
 
-                return method;
-            });
+            if (invocationNodes.Any())
+            {
+                if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)))
+                    newNode = newNode.AddModifiers(SyntaxFactory.Token(SyntaxKind.AsyncKeyword));
+            }
+
+            return newNode;
+        }
+
+        private static void AddRequiredNamespaces(DocumentEditor editor)
+        {
+            if (!(editor.OriginalRoot is CompilationUnitSyntax root)) return;
+
+            string[] namespacesToAdd = new[] { "System.Threading", "System.Threading.Tasks" };
+
+            ImmutableHashSet<string> currentUsings = root.Usings.Select(u => u.Name.ToString()).ToImmutableHashSet();
+            List<string> missingNamespaces = namespacesToAdd.Where(ns => !currentUsings.Contains(ns)).ToList();
+
+            if (missingNamespaces.Count > 0)
+            {
+                IEnumerable<SyntaxNode> importDeclarations = missingNamespaces.Select(ns => editor.Generator.NamespaceImportDeclaration(ns));
+                editor.ReplaceNode(root, (currentRoot, _) => editor.Generator.AddNamespaceImports(currentRoot, importDeclarations));
+            }
         }
 
 
@@ -212,20 +208,7 @@ namespace AsyncChain
             return returnTypeName.StartsWith("System.Threading.Tasks.Task");
         }
 
-        private static bool IsAwaitable(MethodDeclarationSyntax methodDeclaration, SemanticModel semanticModel, CancellationToken cancellationToken = default)
-        {
-            if (semanticModel is null) return false;
 
-            IMethodSymbol methodSymbol = semanticModel.GetDeclaredSymbol(methodDeclaration, cancellationToken);
-            if (methodSymbol is null || methodSymbol.ReturnsVoid) return false;
-
-            ITypeSymbol returnType = methodSymbol.ReturnType;
-            ImmutableArray<ISymbol> awaiterMembers = semanticModel.LookupSymbols(methodDeclaration.SpanStart, returnType, "GetAwaiter");
-
-            return awaiterMembers.Any(s => s is IMethodSymbol ms && ms.Parameters.Length == 0);
-        }
-    
-    
         private class UpdateInfo
         {
             public DocumentId DocumentId { get; set; }
@@ -239,7 +222,8 @@ namespace AsyncChain
 
         private sealed class CallUpdateInfo : UpdateInfo
         {
-
+            public IMethodSymbol CallingMethod { get; set; }
+            public IMethodSymbol CalledMethod { get; set; }
         }
     }
 }
