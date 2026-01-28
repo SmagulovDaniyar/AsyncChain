@@ -118,7 +118,7 @@ namespace AsyncChain
             return updateInfo;
         }
 
-        private static SyntaxNode UpdateInvocationExpression(SyntaxNode currentNode)
+        private static SyntaxNode UpdateInvocationExpression(SemanticModel semanticModel, SyntaxNode currentNode)
         {
             InvocationExpressionSyntax newNode = currentNode as InvocationExpressionSyntax ?? currentNode.FirstAncestorOrSelf<InvocationExpressionSyntax>();
             if (newNode is null) return newNode;
@@ -137,6 +137,44 @@ namespace AsyncChain
                     .WithTrailingTrivia(currentNode.GetTrailingTrivia());
         }
 
+        private static SyntaxNode UpdateReturnStatementSyntax(SyntaxNode currentNode)
+        {
+            ReturnStatementSyntax newNode = currentNode as ReturnStatementSyntax ?? currentNode.FirstAncestorOrSelf<ReturnStatementSyntax>();
+            if (newNode is null) return newNode;
+
+            if (newNode.Expression is null)
+            {
+                newNode = newNode.WithExpression(
+                    SyntaxFactory.MemberAccessExpression(
+                        SyntaxKind.SimpleMemberAccessExpression,
+                        SyntaxFactory.IdentifierName("Task"),
+                        SyntaxFactory.IdentifierName("CompletedTask")
+                    )
+                );
+            }
+            else
+            {
+                ExpressionSyntax originalExpression = newNode.Expression;
+                InvocationExpressionSyntax taskFromResultCall = SyntaxFactory.InvocationExpression(
+                    SyntaxFactory.MemberAccessExpression(
+                        SyntaxKind.SimpleMemberAccessExpression,
+                        SyntaxFactory.IdentifierName("Task"),
+                        SyntaxFactory.IdentifierName("FromResult")
+                    ),
+                    SyntaxFactory.ArgumentList(
+                        SyntaxFactory.SingletonSeparatedList(
+                            SyntaxFactory.Argument(originalExpression.WithoutTrivia())
+                        )
+                    )
+                )
+                .WithTriviaFrom(originalExpression);
+
+                newNode = newNode.WithExpression(taskFromResultCall);
+            }
+
+            return newNode;
+        }
+
         private static MethodDeclarationSyntax UpdateMethodDeclaration(SemanticModel semanticModel, SyntaxNode currentNode, MethodUpdateInfo methodUpdateInfo, List<CallUpdateInfo> callUpdateInfos)
         {
             MethodDeclarationSyntax newNode = currentNode as MethodDeclarationSyntax ?? currentNode.FirstAncestorOrSelf<MethodDeclarationSyntax>();
@@ -145,13 +183,13 @@ namespace AsyncChain
             var invocationNodes = new List<InvocationExpressionSyntax>();
             List<IMethodSymbol> targetSymbols = callUpdateInfos.Select(cui => cui.CalledMethod).ToList();
 
-            foreach (var invocation in newNode.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            foreach (InvocationExpressionSyntax invocation in newNode.DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
                 if (!(semanticModel.GetSymbolInfo(invocation).Symbol is IMethodSymbol methodSymbol)) continue;
                 if (targetSymbols.Any(ts => SymbolEqualityComparer.Default.Equals(ts, methodSymbol))) invocationNodes.Add(invocation);
             }
 
-            newNode = newNode.ReplaceNodes(invocationNodes, (original, rewritten) => UpdateInvocationExpression(original));
+            newNode = newNode.ReplaceNodes(invocationNodes, (original, _) => UpdateInvocationExpression(semanticModel, original));
 
             if (!IsAwaitable(methodUpdateInfo.Method))
             {
@@ -178,6 +216,16 @@ namespace AsyncChain
             {
                 if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)))
                     newNode = newNode.AddModifiers(SyntaxFactory.Token(SyntaxKind.AsyncKeyword));
+            }
+
+            if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)))
+            {
+                List<ReturnStatementSyntax> returnStatementSyntaxes = newNode
+                    .DescendantNodes(n => !(n is AnonymousFunctionExpressionSyntax || n is LocalFunctionStatementSyntax))
+                    .OfType<ReturnStatementSyntax>()
+                    .ToList();
+
+                newNode = newNode.ReplaceNodes(returnStatementSyntaxes, (original, _) => UpdateReturnStatementSyntax(original));
             }
 
             return newNode;
