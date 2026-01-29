@@ -11,7 +11,9 @@ What it does:
 - Adds CancellationToken to method signatures and passes it to all call sites.
 - Finds and updates all callers across the entire solution.
 
-Usage: Place the cursor on a method name → Ctrl+. (Quick Actions) → "Build async chain".</Description>
+Usage: Place the cursor on a method name → Ctrl+. (Quick Actions) → "Build async chain".
+
+Source code: https://github.com/SmagulovDaniyar/AsyncChain</Description>
         <Tags>async, await, refactoring, productivity, roslyn, csharp, dotnet, task, automatic, transformation</Tags>
     </Metadata>
     <Installation>
