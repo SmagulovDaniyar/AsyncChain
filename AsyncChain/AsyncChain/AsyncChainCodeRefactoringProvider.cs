@@ -6,6 +6,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Editing;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Composition;
@@ -107,6 +108,18 @@ namespace AsyncChain
                         methodsToProcess.Enqueue(overrideMethod);
                 }
 
+                if (currentSymbol.IsOverride && currentSymbol.OverriddenMethod != null)
+                {
+                    if (!processedSymbols.Contains(currentSymbol.OverriddenMethod))
+                        methodsToProcess.Enqueue(currentSymbol.OverriddenMethod);
+                }
+
+                foreach (IMethodSymbol interfaceMethod in currentSymbol.ExplicitInterfaceImplementations)
+                {
+                    if (!processedSymbols.Contains(interfaceMethod))
+                        methodsToProcess.Enqueue(interfaceMethod);
+                }
+
                 IEnumerable<SymbolCallerInfo> callers = await SymbolFinder.FindCallersAsync(currentSymbol, solution, cancellationToken).ConfigureAwait(false);
 
                 foreach (SymbolCallerInfo caller in callers)
@@ -133,6 +146,13 @@ namespace AsyncChain
             InvocationExpressionSyntax newNode = currentNode as InvocationExpressionSyntax ?? currentNode.FirstAncestorOrSelf<InvocationExpressionSyntax>();
             if (newNode is null) return newNode;
 
+            if (newNode.Expression is SimpleNameSyntax simpleNameSyntax)
+                newNode = newNode.WithExpression(UpdateInvocationExpressionMethodName(simpleNameSyntax));
+            else if (newNode.Expression is MemberAccessExpressionSyntax memberAccessSyntax)
+                newNode = newNode.WithExpression(memberAccessSyntax.WithName(UpdateInvocationExpressionMethodName(memberAccessSyntax.Name)));
+            else if (newNode.Expression is MemberBindingExpressionSyntax memberBindingExpressionSyntax)
+                newNode = newNode.WithExpression(memberBindingExpressionSyntax.WithName(UpdateInvocationExpressionMethodName(memberBindingExpressionSyntax.Name)));
+
             if (!newNode.ArgumentList.Arguments.Any(a => a.Expression is IdentifierNameSyntax id && id.Identifier.Text == "cancellationToken"))
             {
                 ArgumentSyntax tokenArg = SyntaxFactory.Argument(SyntaxFactory.IdentifierName("cancellationToken"));
@@ -145,6 +165,35 @@ namespace AsyncChain
                 SyntaxFactory.Token(SyntaxKind.AwaitKeyword).WithTrailingTrivia(SyntaxFactory.Space), newNode.WithoutTrivia())
                     .WithLeadingTrivia(currentNode.GetLeadingTrivia())
                     .WithTrailingTrivia(currentNode.GetTrailingTrivia());
+        }
+
+        private static SimpleNameSyntax UpdateInvocationExpressionMethodName(SimpleNameSyntax node)
+        {
+            if (node.Identifier.Text.EndsWith("Async", StringComparison.OrdinalIgnoreCase)) return node;
+
+            return node.WithIdentifier(
+                SyntaxFactory.Identifier(
+                    node.Identifier.LeadingTrivia,
+                    node.Identifier.Text + "Async",
+                    node.Identifier.TrailingTrivia));
+        }
+
+        private static SyntaxNode UpdateReturnStatementSyntax(SyntaxNode currentNode)
+        {
+            ReturnStatementSyntax newNode = currentNode as ReturnStatementSyntax ?? currentNode.FirstAncestorOrSelf<ReturnStatementSyntax>();
+            if (newNode is null) return newNode;
+
+            InvocationExpressionSyntax fromResultInvocation = SyntaxFactory.InvocationExpression(
+                SyntaxFactory.MemberAccessExpression(
+                    SyntaxKind.SimpleMemberAccessExpression,
+                    SyntaxFactory.IdentifierName("Task"),
+                    SyntaxFactory.IdentifierName("FromResult")))
+                .WithArgumentList(
+                    SyntaxFactory.ArgumentList(
+                        SyntaxFactory.SingletonSeparatedList(
+                            SyntaxFactory.Argument(newNode.Expression))));
+
+            return newNode.WithExpression(fromResultInvocation);
         }
 
         private static MethodDeclarationSyntax UpdateMethodDeclaration(SemanticModel semanticModel, SyntaxNode currentNode, MethodUpdateInfo methodUpdateInfo, List<CallUpdateInfo> callUpdateInfos)
@@ -189,6 +238,31 @@ namespace AsyncChain
             {
                 if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)))
                     newNode = newNode.AddModifiers(SyntaxFactory.Token(SyntaxKind.AsyncKeyword));
+            }
+            else if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)) && newNode.Body != null)
+            {
+                List<ReturnStatementSyntax> returns = newNode
+                    .DescendantNodes(node => !(node is AnonymousFunctionExpressionSyntax || node is LocalFunctionStatementSyntax))
+                    .OfType<ReturnStatementSyntax>()
+                    .ToList();
+
+                if (returns.Count == 0)
+                {
+                    ReturnStatementSyntax completedTaskReturn = SyntaxFactory.ReturnStatement(SyntaxFactory.ParseExpression("Task.CompletedTask"));
+                    newNode = newNode.WithBody(newNode.Body.AddStatements(completedTaskReturn));
+                }
+                else
+                {
+                    newNode = newNode.ReplaceNodes(returns, (original, _) => UpdateReturnStatementSyntax(original));
+                }
+            }
+
+            if (!newNode.Identifier.Text.EndsWith("Async", StringComparison.OrdinalIgnoreCase))
+            {
+                newNode = newNode.WithIdentifier(SyntaxFactory.Identifier(
+                    newNode.Identifier.LeadingTrivia,
+                    newNode.Identifier.Text + "Async",
+                    newNode.Identifier.TrailingTrivia));
             }
 
             return newNode;
