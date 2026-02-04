@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Composition;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -21,10 +22,14 @@ namespace AsyncChain
     {
         public override async Task ComputeRefactoringsAsync(CodeRefactoringContext context)
         {
-            SyntaxNode root = await context.Document.GetSyntaxRootAsync(context.CancellationToken).ConfigureAwait(false);
+            SyntaxNode root = await context.Document.GetSyntaxRootAsync().ConfigureAwait(false);
+            SemanticModel semanticModel = await context.Document.GetSemanticModelAsync().ConfigureAwait(false);
             SyntaxNode node = root.FindNode(context.Span);
 
             if (!(node is MethodDeclarationSyntax methodDeclaration)) return;
+
+            IMethodSymbol methodSymbol = semanticModel.GetDeclaredSymbol(methodDeclaration);
+            if (IsAwaitable(methodSymbol)) return;
 
             CodeAction action = CodeAction.Create("Build async chain", cancellationToken => BuildAsyncChain(context.Document, methodDeclaration, cancellationToken));
 
@@ -36,37 +41,31 @@ namespace AsyncChain
             List<UpdateInfo> updateInfos = await GetUpdateInfo(document, methodDeclaration, cancellationToken);
             SolutionEditor solutionEditor = new SolutionEditor(document.Project.Solution);
 
-            var documentChanges = new Dictionary<DocumentEditor, List<(MethodDeclarationSyntax Original, MethodDeclarationSyntax Changed)>>();
-
             foreach (IGrouping<DocumentId, UpdateInfo> documentGroup in updateInfos.GroupBy(i => i.DocumentId))
             {
                 DocumentEditor documentEditor = await solutionEditor.GetDocumentEditorAsync(documentGroup.Key, cancellationToken).ConfigureAwait(false);
-                documentChanges[documentEditor] = new List<(MethodDeclarationSyntax Original, MethodDeclarationSyntax Changed)>();
 
-                ImmutableHashSet<CallUpdateInfo> callUpdateInfos = documentGroup.OfType<CallUpdateInfo>().ToImmutableHashSet();
+                List<CallUpdateInfo> callUpdateInfos = documentGroup.OfType<CallUpdateInfo>().ToList();
                 List<MethodUpdateInfo> methodUpdateInfos = documentGroup.OfType<MethodUpdateInfo>().ToList();
+
+                Dictionary<MethodDeclarationSyntax, MethodDeclarationSyntax> transforms = new Dictionary<MethodDeclarationSyntax, MethodDeclarationSyntax>(); 
 
                 foreach (MethodUpdateInfo methodUpdateInfo in methodUpdateInfos)
                 {
                     List<CallUpdateInfo> invocations = callUpdateInfos.Where(i => SymbolEqualityComparer.Default.Equals(i.CallingMethod, methodUpdateInfo.Method)).ToList();
 
-                    MethodDeclarationSyntax originalMethodNode = documentEditor.OriginalRoot.FindNode(methodUpdateInfo.Span) as MethodDeclarationSyntax;
-                    MethodDeclarationSyntax replaceMethodNode = UpdateMethodDeclaration(documentEditor.SemanticModel, originalMethodNode, methodUpdateInfo, invocations);
+                    MethodDeclarationSyntax originalNode = documentEditor.OriginalRoot.FindNode(methodUpdateInfo.Span) as MethodDeclarationSyntax;
+                    MethodDeclarationSyntax updatedNode = UpdateMethodDeclaration(documentEditor.SemanticModel, originalNode, methodUpdateInfo, invocations);
 
-                    if (originalMethodNode is null || replaceMethodNode is null) continue;
+                    if (originalNode is null || updatedNode is null) continue;
+                    if (originalNode == updatedNode || originalNode.IsEquivalentTo(updatedNode)) continue;
 
-                    documentChanges[documentEditor].Add((originalMethodNode, replaceMethodNode));
-                }
-            }
-
-            foreach (KeyValuePair<DocumentEditor, List<(MethodDeclarationSyntax Original, MethodDeclarationSyntax Changed)>> documentChange in documentChanges)
-            {
-                foreach ((MethodDeclarationSyntax original, MethodDeclarationSyntax changed) in documentChange.Value)
-                {
-                    documentChange.Key.ReplaceNode(original, changed);
+                    transforms[originalNode] = updatedNode;
                 }
 
-                AddRequiredNamespaces(documentChange.Key);
+                SyntaxNode updatedRoot = documentEditor.OriginalRoot.ReplaceNodes(transforms.Keys, (original, _) => transforms[original]);
+                updatedRoot = UpdateNamespaceDeclaration(updatedRoot);
+                documentEditor.ReplaceNode(documentEditor.OriginalRoot, updatedRoot);
             }
 
             return solutionEditor.GetChangedSolution();
@@ -90,6 +89,7 @@ namespace AsyncChain
             while (methodsToProcess.Count > 0)
             {
                 IMethodSymbol currentSymbol = methodsToProcess.Dequeue();
+                
                 if (processedSymbols.Contains(currentSymbol)) continue;
                 processedSymbols.Add(currentSymbol);
 
@@ -120,6 +120,8 @@ namespace AsyncChain
                         methodsToProcess.Enqueue(interfaceMethod);
                 }
 
+                if (IsAwaitable(currentSymbol)) continue;
+
                 IEnumerable<SymbolCallerInfo> callers = await SymbolFinder.FindCallersAsync(currentSymbol, solution, cancellationToken).ConfigureAwait(false);
 
                 foreach (SymbolCallerInfo caller in callers)
@@ -134,17 +136,18 @@ namespace AsyncChain
                         CalledMethod = currentSymbol
                     }));
 
-                    if (!processedSymbols.Contains(callerMethodSymbol) && !IsAwaitable(callerMethodSymbol)) methodsToProcess.Enqueue(callerMethodSymbol);
+                    if (!processedSymbols.Contains(callerMethodSymbol)) methodsToProcess.Enqueue(callerMethodSymbol);
                 }
             }
 
             return updateInfo;
         }
 
-        private static SyntaxNode UpdateInvocationExpression(SemanticModel semanticModel, SyntaxNode currentNode)
+        private static ExpressionSyntax UpdateInvocationExpression(InvocationExpressionSyntax currentNode)
         {
-            InvocationExpressionSyntax newNode = currentNode as InvocationExpressionSyntax ?? currentNode.FirstAncestorOrSelf<InvocationExpressionSyntax>();
-            if (newNode is null) return newNode;
+            if (currentNode is null) return currentNode;
+
+            InvocationExpressionSyntax newNode = currentNode;
 
             if (newNode.Expression is SimpleNameSyntax simpleNameSyntax)
                 newNode = newNode.WithExpression(UpdateInvocationExpressionMethodName(simpleNameSyntax));
@@ -155,7 +158,9 @@ namespace AsyncChain
 
             if (!newNode.ArgumentList.Arguments.Any(a => a.Expression is IdentifierNameSyntax id && id.Identifier.Text == "cancellationToken"))
             {
-                ArgumentSyntax tokenArg = SyntaxFactory.Argument(SyntaxFactory.IdentifierName("cancellationToken"));
+                ArgumentSyntax tokenArg = SyntaxFactory
+                    .Argument(SyntaxFactory.IdentifierName("cancellationToken"))
+                    .WithNameColon(SyntaxFactory.NameColon(SyntaxFactory.IdentifierName("cancellationToken")));
                 newNode = newNode.AddArgumentListArguments(tokenArg);
             }
 
@@ -178,28 +183,56 @@ namespace AsyncChain
                     node.Identifier.TrailingTrivia));
         }
 
-        private static SyntaxNode UpdateReturnStatementSyntax(SyntaxNode currentNode)
+        private static ReturnStatementSyntax UpdateReturnStatementSyntax(ReturnStatementSyntax currentNode)
         {
-            ReturnStatementSyntax newNode = currentNode as ReturnStatementSyntax ?? currentNode.FirstAncestorOrSelf<ReturnStatementSyntax>();
-            if (newNode is null) return newNode;
+            if (currentNode is null) return currentNode;
 
-            InvocationExpressionSyntax fromResultInvocation = SyntaxFactory.InvocationExpression(
+            ReturnStatementSyntax newNode = currentNode;
+
+            if (newNode.Expression is null)
+            {
+                MemberAccessExpressionSyntax completedTaskExpression = SyntaxFactory.MemberAccessExpression(
+                    SyntaxKind.SimpleMemberAccessExpression,
+                    SyntaxFactory.IdentifierName("Task"),
+                    SyntaxFactory.IdentifierName("CompletedTask")
+                );
+
+                return newNode
+                    .WithExpression(completedTaskExpression)
+                    .WithReturnKeyword(newNode.ReturnKeyword.WithTrailingTrivia(SyntaxFactory.Space));
+            }
+
+            if (newNode.Expression is MemberAccessExpressionSyntax memberAccessExpressionSyntax)
+            {
+                if (memberAccessExpressionSyntax.Expression.ToString() == nameof(Task) && memberAccessExpressionSyntax.Name.Identifier.Text == nameof(Task.CompletedTask)) return newNode;
+            }
+
+            if (newNode.Expression is InvocationExpressionSyntax invocation && invocation.Expression is MemberAccessExpressionSyntax taskMemberAccessExpressionSyntax)
+            {
+                if (taskMemberAccessExpressionSyntax.Expression.ToString() == nameof(Task) && taskMemberAccessExpressionSyntax.Name.Identifier.Text == nameof(Task.FromResult)) return newNode;
+            }
+
+            InvocationExpressionSyntax taskFromResultInvocation = SyntaxFactory.InvocationExpression(
                 SyntaxFactory.MemberAccessExpression(
                     SyntaxKind.SimpleMemberAccessExpression,
                     SyntaxFactory.IdentifierName("Task"),
-                    SyntaxFactory.IdentifierName("FromResult")))
-                .WithArgumentList(
-                    SyntaxFactory.ArgumentList(
-                        SyntaxFactory.SingletonSeparatedList(
-                            SyntaxFactory.Argument(newNode.Expression))));
+                    SyntaxFactory.IdentifierName("FromResult")
+                ),
+                SyntaxFactory.ArgumentList(
+                    SyntaxFactory.SingletonSeparatedList(
+                        SyntaxFactory.Argument(newNode.Expression.WithoutTrivia())
+                    )
+                )
+            );
 
-            return newNode.WithExpression(fromResultInvocation);
+            return newNode.WithExpression(taskFromResultInvocation);
         }
 
-        private static MethodDeclarationSyntax UpdateMethodDeclaration(SemanticModel semanticModel, SyntaxNode currentNode, MethodUpdateInfo methodUpdateInfo, List<CallUpdateInfo> callUpdateInfos)
+        private static MethodDeclarationSyntax UpdateMethodDeclaration(SemanticModel semanticModel, MethodDeclarationSyntax currentNode, MethodUpdateInfo methodUpdateInfo, List<CallUpdateInfo> callUpdateInfos)
         {
-            MethodDeclarationSyntax newNode = currentNode as MethodDeclarationSyntax ?? currentNode.FirstAncestorOrSelf<MethodDeclarationSyntax>();
-            if (newNode is null) return null;
+            if (currentNode is null) return currentNode;
+
+            MethodDeclarationSyntax newNode = currentNode;
 
             var invocationNodes = new List<InvocationExpressionSyntax>();
             List<IMethodSymbol> targetSymbols = callUpdateInfos.Select(cui => cui.CalledMethod).ToList();
@@ -211,7 +244,7 @@ namespace AsyncChain
                 if (targetSymbols.Any(ts => name == ts.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))) invocationNodes.Add(invocation);
             }
 
-            newNode = newNode.ReplaceNodes(invocationNodes, (original, _) => UpdateInvocationExpression(semanticModel, original));
+            newNode = newNode.ReplaceNodes(invocationNodes, (original, _) => UpdateInvocationExpression(original));
 
             if (!IsAwaitable(methodUpdateInfo.Method))
             {
@@ -234,27 +267,15 @@ namespace AsyncChain
                 newNode = newNode.AddParameterListParameters(tokenParameter);
             }
 
-            if (invocationNodes.Any())
+            if (invocationNodes.Count > 0)
             {
                 if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)))
                     newNode = newNode.AddModifiers(SyntaxFactory.Token(SyntaxKind.AsyncKeyword));
             }
-            else if (!newNode.Modifiers.Any(m => m.IsKind(SyntaxKind.AsyncKeyword)) && newNode.Body != null)
+            else
             {
-                List<ReturnStatementSyntax> returns = newNode
-                    .DescendantNodes(node => !(node is AnonymousFunctionExpressionSyntax || node is LocalFunctionStatementSyntax))
-                    .OfType<ReturnStatementSyntax>()
-                    .ToList();
-
-                if (returns.Count == 0)
-                {
-                    ReturnStatementSyntax completedTaskReturn = SyntaxFactory.ReturnStatement(SyntaxFactory.ParseExpression("Task.CompletedTask"));
-                    newNode = newNode.WithBody(newNode.Body.AddStatements(completedTaskReturn));
-                }
-                else
-                {
-                    newNode = newNode.ReplaceNodes(returns, (original, _) => UpdateReturnStatementSyntax(original));
-                }
+                List<ReturnStatementSyntax> returnStatementSyntaxes = newNode.DescendantNodes().OfType<ReturnStatementSyntax>().ToList();
+                if (returnStatementSyntaxes.Count > 0) newNode = newNode.ReplaceNodes(returnStatementSyntaxes, (original, _) => UpdateReturnStatementSyntax(original));
             }
 
             if (!newNode.Identifier.Text.EndsWith("Async", StringComparison.OrdinalIgnoreCase))
@@ -268,20 +289,18 @@ namespace AsyncChain
             return newNode;
         }
 
-        private static void AddRequiredNamespaces(DocumentEditor editor)
+        private static SyntaxNode UpdateNamespaceDeclaration(SyntaxNode currentNode)
         {
-            if (!(editor.OriginalRoot is CompilationUnitSyntax root)) return;
+            if (!(currentNode is CompilationUnitSyntax newNode)) return currentNode;
 
             string[] namespacesToAdd = new[] { "System.Threading", "System.Threading.Tasks" };
 
-            ImmutableHashSet<string> currentUsings = root.Usings.Select(u => u.Name.ToString()).ToImmutableHashSet();
+            ImmutableHashSet<string> currentUsings = newNode.Usings.Select(u => u.Name.ToString()).ToImmutableHashSet();
             List<string> missingNamespaces = namespacesToAdd.Where(ns => !currentUsings.Contains(ns)).ToList();
 
-            if (missingNamespaces.Count > 0)
-            {
-                IEnumerable<SyntaxNode> importDeclarations = missingNamespaces.Select(ns => editor.Generator.NamespaceImportDeclaration(ns));
-                editor.ReplaceNode(root, (currentRoot, _) => editor.Generator.AddNamespaceImports(currentRoot, importDeclarations));
-            }
+            if (missingNamespaces.Count > 0) newNode = newNode.AddUsings(missingNamespaces.Select(ns => SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(ns))).ToArray());
+
+            return newNode;
         }
 
 
